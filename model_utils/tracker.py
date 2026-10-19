@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextvars
+from contextlib import contextmanager
 from copy import deepcopy
 from functools import wraps
 from typing import (
@@ -26,6 +28,42 @@ if TYPE_CHECKING:
         _deferred_fields: set[str]
 
 T = TypeVar("T")
+
+
+# Models created while this context is active keep a persistent marker and skip
+# the eager saved-value snapshot.  The marker is never cleared: such an instance
+# must not be saved or diffed, even after the surrounding request leaves the
+# scope.  The context is a ContextVar so threads and async tasks stay isolated.
+_READ_ONLY_TRACKING_MODELS: contextvars.ContextVar[frozenset[type[models.Model]]] = contextvars.ContextVar(
+    "model_utils_read_only_tracking_models",
+    default=frozenset(),
+)
+
+
+class ReadOnlyTrackerError(RuntimeError):
+    """A snapshot-free, read-only instance was used for diffing or persistence."""
+
+
+@contextmanager
+def read_only_tracking(*model_classes: type[models.Model]):
+    """Materialize the named models without a saved-value tracker snapshot.
+
+    Use this only around a read-only list that neither saves nor diffs the rows.
+    Instances created in the scope reject tracker comparisons and every save or
+    refresh path, so they cannot silently persist a wrong change set.  Existing
+    instances and models not named here keep normal tracking.
+    """
+    token = _READ_ONLY_TRACKING_MODELS.set(
+        _READ_ONLY_TRACKING_MODELS.get() | frozenset(model_classes)
+    )
+    try:
+        yield
+    finally:
+        _READ_ONLY_TRACKING_MODELS.reset(token)
+
+
+def _marks_read_only(instance: models.Model) -> bool:
+    return instance.__class__ in _READ_ONLY_TRACKING_MODELS.get()
 
 
 class Descriptor(Protocol[T]):
@@ -226,6 +264,11 @@ class FieldInstanceTracker:
         self.fields = fields
         self.field_map = field_map
         self.context = FieldsContext(self, *self.fields)
+        # The marker lives on the instance, so leaving the request scope cannot
+        # turn a snapshot-free row into a writable one.
+        self.snapshot_skipped = bool(getattr(instance, "_skip_tracker_snapshot", False))
+        if self.snapshot_skipped:
+            self.saved_data: dict[str, Any] = {}
 
     def __enter__(self) -> FieldsContext:
         return self.context.__enter__()
@@ -248,7 +291,16 @@ class FieldInstanceTracker:
     def get_field_value(self, field: str) -> Any:
         return getattr(self.instance, self.field_map[field])
 
+    def _assert_snapshot(self) -> None:
+        if getattr(self, "snapshot_skipped", False):
+            raise ReadOnlyTrackerError(
+                "%s was loaded for read-only serialization and has no saved tracker "
+                "snapshot; fetch a normal instance before diffing, saving, or "
+                "refreshing it" % type(self.instance).__name__
+            )
+
     def set_saved_fields(self, fields: Iterable[str] | None = None) -> None:
+        self._assert_snapshot()
         if not self.instance.pk:
             self.saved_data = {}
         elif fields is None:
@@ -276,6 +328,7 @@ class FieldInstanceTracker:
 
     def has_changed(self, field: str) -> bool:
         """Returns ``True`` if field has changed from currently saved value"""
+        self._assert_snapshot()
         if field in self.fields:
             # deferred fields haven't changed
             if field in self.deferred_fields and field not in self.instance.__dict__:
@@ -288,6 +341,7 @@ class FieldInstanceTracker:
 
     def previous(self, field: str) -> Any:
         """Returns currently saved value of given field"""
+        self._assert_snapshot()
 
         # handle deferred fields that have not yet been loaded from the database
         if self.instance.pk and field in self.deferred_fields and field not in self.saved_data:
@@ -308,6 +362,7 @@ class FieldInstanceTracker:
 
     def changed(self) -> dict[str, Any]:
         """Returns dict of fields that changed since save (with old values)"""
+        self._assert_snapshot()
         return {
             field: self.previous(field)
             for field in self.fields
@@ -395,7 +450,8 @@ class FieldTracker:
             return  # Only init instances of given model (including children)
         tracker = self.tracker_class(instance, self.fields, self.field_map)
         setattr(instance, self.attname, tracker)
-        tracker.set_saved_fields()
+        if not getattr(tracker, "snapshot_skipped", False):
+            tracker.set_saved_fields()
         cast('_AugmentedModel', instance)._instance_initialized = True
 
     def patch_init(self, model: type[models.Model]) -> None:
@@ -403,6 +459,10 @@ class FieldTracker:
 
         @wraps(original)
         def inner(instance: models.Model, *args: Any, **kwargs: Any) -> None:
+            if _marks_read_only(instance):
+                # Set before the model constructor runs: FSM bootstrap can create
+                # its helper from inside that constructor.
+                instance.__dict__["_skip_tracker_snapshot"] = True
             original(instance, *args, **kwargs)
             self.initialize_tracker(model, instance)
 
@@ -426,6 +486,11 @@ class FieldTracker:
                     field in self.fields
                 )
             tracker = getattr(instance, self.attname)
+            if getattr(tracker, "snapshot_skipped", False):
+                raise ReadOnlyTrackerError(
+                    "%s was loaded for read-only serialization and cannot be "
+                    "saved or refreshed" % type(instance).__name__
+                )
             with tracker(*fields):
                 return original(instance, *args, **kwargs)
 
@@ -450,6 +515,7 @@ class ModelInstanceTracker(FieldInstanceTracker):
 
     def has_changed(self, field: str) -> bool:
         """Returns ``True`` if field has changed from currently saved value"""
+        self._assert_snapshot()
         if not self.instance.pk:
             return True
         elif field in self.saved_data:
@@ -461,6 +527,7 @@ class ModelInstanceTracker(FieldInstanceTracker):
 
     def changed(self) -> dict[str, Any]:
         """Returns dict of fields that changed since save (with old values)"""
+        self._assert_snapshot()
         if not self.instance.pk:
             return {}
         saved = self.saved_data.items()

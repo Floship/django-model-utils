@@ -9,7 +9,12 @@ from django.db.models.fields.files import FieldFile
 from django.test import TestCase
 
 from model_utils import FieldTracker
-from model_utils.tracker import DescriptorWrapper, FieldInstanceTracker
+from model_utils.tracker import (
+    DescriptorWrapper,
+    FieldInstanceTracker,
+    ReadOnlyTrackerError,
+    read_only_tracking,
+)
 from tests.models import (
     InheritedModelTracked,
     InheritedTracked,
@@ -983,3 +988,58 @@ class TrackerContextDecoratorTests(TestCase):
             self.assertChanged('name')
 
         self.assertNotChanged('name')
+
+
+class ReadOnlyTrackerModeTests(TestCase):
+    """A list row can skip its snapshot without becoming silently writable."""
+
+    def setUp(self) -> None:
+        self.instance = Tracked.objects.create(name="tracked", number=1)
+        self.other = TrackedNotDefault.objects.create(name="other", number=2)
+
+    def test_named_model_created_in_scope_has_no_snapshot(self) -> None:
+        with read_only_tracking(Tracked):
+            row = Tracked.objects.get(pk=self.instance.pk)
+
+        self.assertTrue(row.tracker.snapshot_skipped)
+        self.assertEqual(row.tracker.saved_data, {})
+
+        # The marker stays on the instance after the scope exits.
+        for operation in (
+            lambda: row.tracker.previous("name"),
+            lambda: row.tracker.has_changed("name"),
+            lambda: row.tracker.changed(),
+            lambda: row.tracker.set_saved_fields(),
+            row.save,
+            row.refresh_from_db,
+        ):
+            with self.assertRaises(ReadOnlyTrackerError):
+                operation()
+
+    def test_rows_outside_the_scope_keep_normal_tracking(self) -> None:
+        row = Tracked.objects.get(pk=self.instance.pk)
+
+        self.assertFalse(row.tracker.snapshot_skipped)
+        self.assertEqual(row.tracker.saved_data["name"], "tracked")
+        row.name = "changed"
+        self.assertTrue(row.tracker.has_changed("name"))
+
+    def test_scope_only_marks_named_models(self) -> None:
+        with read_only_tracking(Tracked):
+            skipped = Tracked.objects.get(pk=self.instance.pk)
+            normal = TrackedNotDefault.objects.get(pk=self.other.pk)
+
+        self.assertTrue(skipped.tracker.snapshot_skipped)
+        self.assertFalse(normal.name_tracker.snapshot_skipped)
+        self.assertEqual(normal.name_tracker.saved_data["name"], "other")
+
+    def test_nested_scopes_reset_independently(self) -> None:
+        with read_only_tracking(Tracked):
+            outer = Tracked.objects.get(pk=self.instance.pk)
+            with read_only_tracking(TrackedNotDefault):
+                inner = TrackedNotDefault.objects.get(pk=self.other.pk)
+            after_inner = TrackedNotDefault.objects.get(pk=self.other.pk)
+
+        self.assertTrue(outer.tracker.snapshot_skipped)
+        self.assertTrue(inner.name_tracker.snapshot_skipped)
+        self.assertFalse(after_inner.name_tracker.snapshot_skipped)
