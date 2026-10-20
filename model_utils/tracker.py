@@ -269,6 +269,7 @@ class FieldInstanceTracker:
         # tracked row into cyclic garbage, which can accumulate inside a long batch
         # until a full-heap collection. A proxy keeps the instance accessible while
         # it is alive without making the tracker part of its reference cycle.
+        self._instance_ref = weakref.ref(instance)
         self.instance = cast('_AugmentedModel', weakref.proxy(instance))
         self.fields = fields
         self.field_map = field_map
@@ -278,6 +279,33 @@ class FieldInstanceTracker:
         self.snapshot_skipped = bool(getattr(instance, "_skip_tracker_snapshot", False))
         if self.snapshot_skipped:
             self.saved_data: dict[str, Any] = {}
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> FieldInstanceTracker:
+        """Keep a copied tracker attached to the copied model, not the original.
+
+        Django's test data and application code both deep-copy model instances. A copied
+        ``weakref.proxy`` cannot discover the corresponding copied model by itself, so it would
+        keep reporting changes against the source row. Rebuild the weak references from Django's
+        active copy memo and let the copied tracker reference the copied instance.
+        """
+        clone = self.__class__.__new__(self.__class__)
+        memo[id(self)] = clone
+
+        original = self._instance_ref()
+        copied = memo.get(id(original)) if original is not None else None
+        bound_instance = copied if copied is not None else original
+        if bound_instance is not None:
+            clone._instance_ref = weakref.ref(bound_instance)
+            clone.instance = cast('_AugmentedModel', weakref.proxy(bound_instance))
+
+        for key, value in self.__dict__.items():
+            if key in {'_instance_ref', 'instance', 'context'}:
+                continue
+            setattr(clone, key, deepcopy(value, memo))
+
+        state = deepcopy(self.context.state, memo)
+        clone.context = FieldsContext(clone, *clone.fields, state=state)
+        return clone
 
     def __enter__(self) -> FieldsContext:
         return self.context.__enter__()
@@ -445,6 +473,7 @@ class FieldTracker:
             setattr(sender, field_name, wrapped_descriptor)
         self.field_map = self.get_field_map(sender)
         self.patch_init(sender)
+        self.patch_serialization(sender)
         self.model_class = sender
         setattr(sender, self.name, self)
         self.patch_save(sender)
@@ -480,6 +509,25 @@ class FieldTracker:
     def patch_save(self, model: type[models.Model]) -> None:
         self._patch(model, 'save_base', 'update_fields')
         self._patch(model, 'refresh_from_db', 'fields')
+
+    def patch_serialization(self, model: type[models.Model]) -> None:
+        """Drop weak references from the pickle state and rebuild trackers on load."""
+        original_getstate = getattr(model, '__getstate__')
+        original_setstate = getattr(model, '__setstate__')
+
+        @wraps(original_getstate)
+        def getstate(instance: models.Model) -> dict[str, Any]:
+            state = original_getstate(instance)
+            state.pop(self.attname, None)
+            return state
+
+        @wraps(original_setstate)
+        def setstate(instance: models.Model, state: dict[str, Any]) -> None:
+            original_setstate(instance, state)
+            self.initialize_tracker(model, instance)
+
+        setattr(model, '__getstate__', getstate)
+        setattr(model, '__setstate__', setstate)
 
     def _patch(self, model: type[models.Model], method: str, fields_kwarg: str) -> None:
         original = getattr(model, method)

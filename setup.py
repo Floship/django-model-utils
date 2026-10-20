@@ -18,7 +18,7 @@ long_description = "\n\n".join(long_desc(HERE))
 
 setup(
     name='django-model-utils',
-    version='5.0.0.post3',
+    version='5.0.0.post4',
     license="BSD",
     description='Django model mixins and utilities',
     long_description=long_description,

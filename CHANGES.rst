@@ -1,6 +1,10 @@
 Changelog
 =========
 
+5.0.0.post4
+------------
+- Keep weak-reference field trackers bound to deep-copied and unpickled model instances.
+
 5.0.0 (2024-09-01)
 ------------------
 - Add formal support for `Django 5.1`

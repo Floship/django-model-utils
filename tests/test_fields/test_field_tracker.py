@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import weakref
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
 from django.core.cache import cache
@@ -1005,6 +1006,15 @@ class TrackerLifecycleTests(TestCase):
             self.assertIsNone(tracker_ref())
         finally:
             gc.enable()
+
+    def test_deepcopy_rebinds_the_tracker_to_the_copied_row(self) -> None:
+        row = Tracked.objects.create(name='original', number=1)
+        copied = deepcopy(row)
+
+        copied.name = 'copied'
+
+        self.assertTrue(copied.tracker.has_changed('name'))
+        self.assertFalse(row.tracker.has_changed('name'))
 
 
 class ReadOnlyTrackerModeTests(TestCase):
