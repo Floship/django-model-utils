@@ -18,8 +18,7 @@ long_description = "\n\n".join(long_desc(HERE))
 
 setup(
     name='django-model-utils',
-    use_scm_version={"version_scheme": "post-release"},
-    setup_requires=["setuptools_scm"],
+    version='5.0.0.post3',
     license="BSD",
     description='Django model mixins and utilities',
     long_description=long_description,
