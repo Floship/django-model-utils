@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gc
+import weakref
 from typing import TYPE_CHECKING, Any
 
 from django.core.cache import cache
@@ -988,6 +990,21 @@ class TrackerContextDecoratorTests(TestCase):
             self.assertChanged('name')
 
         self.assertNotChanged('name')
+
+
+class TrackerLifecycleTests(TestCase):
+    def test_tracker_does_not_keep_a_row_alive(self) -> None:
+        row = Tracked()
+        instance_ref = weakref.ref(row)
+        tracker_ref = weakref.ref(row.tracker)
+
+        gc.disable()
+        try:
+            del row
+            self.assertIsNone(instance_ref())
+            self.assertIsNone(tracker_ref())
+        finally:
+            gc.enable()
 
 
 class ReadOnlyTrackerModeTests(TestCase):

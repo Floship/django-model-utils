@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextvars
+import weakref
 from contextlib import contextmanager
 from copy import deepcopy
 from functools import wraps
@@ -223,7 +224,11 @@ class FieldsContext:
         """
         if state is None:
             state = {}
-        self.tracker = tracker
+        # A tracker owns its base FieldsContext. Holding that context strongly here
+        # would keep the tracker alive after its model row is released and force the
+        # cyclic collector to clean up every tracked row. Callers keep the tracker
+        # alive while a context is active; the weak proxy removes the cycle.
+        self.tracker = weakref.proxy(tracker)
         self.fields = fields
         self.state = state
 
@@ -260,7 +265,11 @@ class FieldsContext:
 
 class FieldInstanceTracker:
     def __init__(self, instance: models.Model, fields: Iterable[str], field_map: Mapping[str, str]):
-        self.instance = cast('_AugmentedModel', instance)
+        # The model holds this tracker. Holding the model strongly here turns every
+        # tracked row into cyclic garbage, which can accumulate inside a long batch
+        # until a full-heap collection. A proxy keeps the instance accessible while
+        # it is alive without making the tracker part of its reference cycle.
+        self.instance = cast('_AugmentedModel', weakref.proxy(instance))
         self.fields = fields
         self.field_map = field_map
         self.context = FieldsContext(self, *self.fields)
